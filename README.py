@@ -2,12 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-bot.py — Triple+3 Strategies (Self-Evolving) Scalper — Binance USDM, Alerts-Only
+bot.py — Triple+3 Strategies (Self-Evolving) Scalper — OKX USDT Perps
 (نسخة بدون أي تكامل مع OpenAI — تداول/إشعارات فقط)
 
-تعليمي فقط — لا ينفّذ أوامر تداول حقيقية (Paper Engine).
 Env:
-  BINANCE_API_KEY, BINANCE_API_SECRET
+  OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSWORD, OKX_TESTNET=1 (اختياري)
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   (اختياري) CRYPTOPANIC_TOKEN, NEWSAPI_KEY  ← تقدر تسيبهم فاضيين
 """
@@ -168,10 +167,18 @@ class Config:
     daily_stop_enabled: bool = True
     daily_stop_pct: float = 0.02  # 2%
 
+    # Live trading
+    live_trading: bool = True
+    leverage: int = 10
+    position_fraction: float = 0.90
+    margin_mode: str = "cross"
+    use_testnet: bool = False
+
     # Files
     logs_dir: str = "./logs"
     signals_csv: str = "./logs/signals_log.csv"
     trades_csv: str  = "./logs/trades_log.csv"
+    trades_live_csv: str = "./logs/trades_live.csv"
     models_csv: str  = "./logs/models_log.csv"
     ml_csv: str      = "./logs/ml_dataset.csv"
     state_json: str  = "./logs/state.json"
@@ -204,19 +211,31 @@ class Notifier:
 
 class FuturesExchange:
     def __init__(self, cfg: Config):
-        key = os.getenv("BINANCE_API_KEY")
-        secret = os.getenv("BINANCE_API_SECRET")
-        self.x = ccxt.binanceusdm({
-            "apiKey": key, "secret": secret,
-            "options": {"defaultType": "future"},
+        key = os.getenv("OKX_API_KEY")
+        secret = os.getenv("OKX_API_SECRET")
+        pwd = os.getenv("OKX_API_PASSWORD")
+        params = {
+            "apiKey": key,
+            "secret": secret,
+            "password": pwd,
             "enableRateLimit": True,
-            "timeout": 15000
-        })
+            "timeout": 15000,
+            "options": {"defaultType": "swap", "defaultSettle": "USDT"}
+        }
+        self.x = ccxt.okx(params)
+        if cfg.use_testnet or os.getenv("OKX_TESTNET") == "1":
+            try: self.x.set_sandbox_mode(True)
+            except Exception: pass
         self.x.load_markets()
+        try:
+            self.x.set_position_mode(False)
+        except Exception:
+            pass
         self.cfg = cfg
         self._universe_cache: Dict[str, any] = {"ts": 0.0, "symbols": []}
         self._health_cache: Dict[str, float] = {}
         self._bad_cache: Dict[str, float] = {}
+        self._lev_cache: Dict[str, bool] = {}
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
         ohlcv = self.x.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -229,16 +248,22 @@ class FuturesExchange:
 
     def fetch_funding_rate(self, symbol: str) -> Optional[float]:
         try:
-            m = self.x.market(symbol)
-            fr = self.x.fapiPublic_get_premiumindex({"symbol": m["id"]})
-            return safe_float(fr.get("lastFundingRate", None), default=None)
+            fr = self.x.fetch_funding_rate(symbol)
+            return safe_float(fr.get("fundingRate", None), default=None)
         except Exception:
             return None
 
     def get_balance_usdt(self) -> float:
         try:
-            bal = self.x.fetch_balance(params={"type":"future"})
-            return float(bal["total"].get("USDT", 0.0))
+            bal = self.x.fetch_balance()
+            return float(bal.get("total", {}).get("USDT", 0.0))
+        except Exception:
+            return 0.0
+
+    def get_free_balance_usdt(self) -> float:
+        try:
+            bal = self.x.fetch_balance()
+            return float(bal.get("free", {}).get("USDT", 0.0))
         except Exception:
             return 0.0
 
@@ -257,12 +282,12 @@ class FuturesExchange:
                 t = tickers.get(sym, {})
                 qv = t.get("quoteVolume")
                 if qv is None:
-                    qv = float(t.get("info", {}).get("quoteVolume", 0) or 0)
+                    qv = float(t.get("info", {}).get("volCcy24h", 0) or 0)
                 top.append((sym, float(qv)))
             top.sort(key=lambda x: x[1], reverse=True)
-            syms = [s for s,_ in top[:n]] or ["BTC/USDT","ETH/USDT"]
+            syms = [s for s,_ in top[:n]] or ["BTC/USDT:USDT","ETH/USDT:USDT"]
         except Exception:
-            syms = ["BTC/USDT","ETH/USDT"]
+            syms = ["BTC/USDT:USDT","ETH/USDT:USDT"]
         self._universe_cache = {"ts": nowt, "symbols": syms}
         return syms
 
@@ -286,8 +311,73 @@ class FuturesExchange:
                 self._bad_cache[s] = nowt
             time.sleep(0.05)
         if not ok:
-            ok = ["BTC/USDT","ETH/USDT"]
+            ok = ["BTC/USDT:USDT","ETH/USDT:USDT"]
         return ok
+
+    def has_position(self, symbol: str) -> bool:
+        try:
+            pos = self.x.fetch_positions([symbol])
+            for p in pos:
+                size = abs(float(p.get("contracts") or p.get("positionAmt") or p.get("info", {}).get("pos", 0)))
+                if p.get("symbol") == symbol and size > 0:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _ensure_leverage(self, symbol: str, cfg: Config):
+        if self._lev_cache.get(symbol):
+            return
+        try:
+            self.x.set_leverage(cfg.leverage, symbol, {"mgnMode": cfg.margin_mode})
+            self._lev_cache[symbol] = True
+        except Exception:
+            pass
+
+    def execute_trade(self, symbol: str, side: str, price: float, tp: float, sl: float, cfg: Config):
+        if not cfg.live_trading:
+            return None
+        if self.has_position(symbol):
+            print(f"[LIVE] Skip {symbol}, position already open")
+            return None
+        free = self.get_free_balance_usdt()
+        if free <= 0:
+            print("[LIVE] No free USDT balance")
+            return None
+        amount = (free * cfg.position_fraction * cfg.leverage) / price
+        m = self.x.market(symbol)
+        amount = float(self.x.amount_to_precision(symbol, amount))
+        min_amt = m.get("limits", {}).get("amount", {}).get("min")
+        max_amt = m.get("limits", {}).get("amount", {}).get("max")
+        if min_amt is not None and amount < float(min_amt):
+            print(f"[LIVE] Amount {amount} < min {min_amt}")
+            return None
+        if max_amt is not None and amount > float(max_amt):
+            amount = float(max_amt)
+        self._ensure_leverage(symbol, cfg)
+        tp_px = self.x.price_to_precision(symbol, tp)
+        sl_px = self.x.price_to_precision(symbol, sl)
+        params = {
+            "tdMode": cfg.margin_mode,
+            "reduceOnly": False,
+            "tpTriggerPx": str(tp_px),
+            "tpOrdPx": "-1",
+            "slTriggerPx": str(sl_px),
+            "slOrdPx": "-1",
+        }
+        try:
+            order = self.x.create_order(symbol, "market", side, amount, None, params)
+        except Exception:
+            try:
+                order = self.x.create_order(symbol, "market", side, amount, None, {"tdMode": cfg.margin_mode, "reduceOnly": False})
+                opp = "sell" if side == "buy" else "buy"
+                ro_params = {"tdMode": cfg.margin_mode, "reduceOnly": True}
+                self.x.create_order(symbol, "market", opp, amount, None, {**ro_params, "triggerPx": str(tp_px), "ordPx": "-1"})
+                self.x.create_order(symbol, "market", opp, amount, None, {**ro_params, "triggerPx": str(sl_px), "ordPx": "-1"})
+            except Exception as e:
+                print(f"[LIVE] order error {e}")
+                return None
+        return order
 
 # =========================
 # Indicators
@@ -639,6 +729,7 @@ class Paper:
         self.ref_equity = ref_equity
         self.open: Dict[str, PaperTrade] = {}
         ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv); ensure_dir(cfg.state_json)
+        ensure_dir(cfg.trades_live_csv)
         if not os.path.exists(cfg.signals_csv):
             pd.DataFrame(columns=[
                 "time","symbol","tf","price","side","model","tp","sl",
@@ -649,6 +740,10 @@ class Paper:
             pd.DataFrame(columns=[
                 "id","open_time","close_time","symbol","tf","side","entry","exit","result","model","pnl_usd","hold_sec","ctx_key"
             ]).to_csv(cfg.trades_csv, index=False)
+        if not os.path.exists(cfg.trades_live_csv):
+            pd.DataFrame(columns=[
+                "id","open_time","close_time","symbol","tf","side","entry","exit","result","model","pnl_usd","hold_sec","ctx_key"
+            ]).to_csv(cfg.trades_live_csv, index=False)
         if not os.path.exists(cfg.ml_csv):
             pd.DataFrame(columns=[
                 "trade_id","symbol","tf","side","model","open_time","close_time","result","pnl_usd",
@@ -711,6 +806,8 @@ class Paper:
                 "result": t.result, "model": t.model, "pnl_usd": t.pnl_usd, "hold_sec": hold, "ctx_key": ctx
             })
         pd.DataFrame(rows).to_csv(cfg.trades_csv, mode="a", header=False, index=False)
+        if cfg.live_trading:
+            pd.DataFrame(rows).to_csv(cfg.trades_live_csv, mode="a", header=False, index=False)
 
     def ml_snapshot(self, trade_id:str, symbol:str, row:pd.Series, regime:Regime):
         feat = {
@@ -1128,6 +1225,8 @@ class Bot:
                 asset = symbol.split("/")[0]
                 if self.cfg.news_enabled and self.news.too_hot(asset):
                     continue
+                if self.cfg.live_trading and self.ex.has_position(symbol):
+                    continue
                 if self.cfg.funding_filter:
                     fr = self.ex.fetch_funding_rate(symbol)
                     if fr is not None and abs(fr) > self.cfg.max_abs_funding:
@@ -1166,14 +1265,28 @@ class Bot:
                     f"📏 R:R = {rr if rr is not None else 'n/a'}\n\n"
                     f"🧠 Why: {sig.reason}\n"
                     f"📦 SizeRef: ~{qty_ref:.6f} ({notional_ref:.2f} USDT)\n"
-                    f"⚠️ Alert Only – No Auto Execution"
                 )
+                msg += "🚀 LIVE Trade" if self.cfg.live_trading else "⚠️ Alert Only – No Auto Execution"
                 self.notifier.send(msg)
                 self.last_alert_ts = time.time()
 
                 self.paper.log_signal(symbol, row, sig, qty_ref, notional_ref, rr, self.cfg, regime)
                 t = self.paper.open_virtual(symbol, price, sig, self.cfg)
                 self.paper.ml_snapshot(t.id, symbol, row, regime)
+
+                if self.cfg.live_trading:
+                    order = self.ex.execute_trade(symbol, sig.side, price, float(sig.tp), float(sig.sl), self.cfg)
+                    if order:
+                        amt = order.get("amount") or order.get("filled")
+                        fill = order.get("average") or order.get("price")
+                        oid = order.get("id")
+                        self.notifier.send(
+                            f"🚀 LIVE EXECUTED\n"
+                            f"• {sig.side.upper()} {symbol}\n"
+                            f"• Qty: {amt} @ {fill}\n"
+                            f"• OrderID: {oid}\n"
+                            f"• TP: {sig.tp:.4f} | SL: {sig.sl:.4f}"
+                        )
 
                 self.last_key[symbol] = key
                 self.last_time[symbol] = now_utc()
@@ -1194,7 +1307,12 @@ def parse_args() -> Config:
     p.add_argument("--top", type=int, default=None, help="Top N USDT perpetuals to scan (override config)")
     p.add_argument("--minconf", type=float, default=None, help="Min confidence to accept (override config)")
     p.add_argument("--agree", type=int, default=None, help="Min base models agreeing (override config)")
-    p.add_argument("--dailystop", type=float, default=None, help="Daily stop pct (e.g., 0.02 for 2%)")
+    p.add_argument("--dailystop", type=float, default=None, help="Daily stop pct (e.g., 0.02 for 2%%)")
+    p.add_argument("--live", default=None, help="true/false to enable live trading")
+    p.add_argument("--lev", type=int, default=None, help="Leverage")
+    p.add_argument("--pxfrac", type=float, default=None, help="Position fraction (0-1)")
+    p.add_argument("--mode", default=None, choices=["cross","isolated"], help="Margin mode")
+    p.add_argument("--testnet", default=None, help="1 or 0 to use testnet")
     args = p.parse_args()
     cfg = Config()
     cfg.timeframe = args.timeframe
@@ -1204,8 +1322,14 @@ def parse_args() -> Config:
     if args.minconf is not None: cfg.min_confidence_accept = float(args.minconf)
     if args.agree is not None: cfg.committee_min_agree = int(args.agree)
     if args.dailystop is not None: cfg.daily_stop_pct = float(args.dailystop)
+    if args.live is not None: cfg.live_trading = str(args.live).lower() in ("1","true","yes")
+    if args.lev is not None: cfg.leverage = int(args.lev)
+    if args.pxfrac is not None: cfg.position_fraction = float(args.pxfrac)
+    if args.mode is not None: cfg.margin_mode = args.mode
+    if args.testnet is not None: cfg.use_testnet = str(args.testnet).lower() in ("1","true","yes")
     ensure_dir(cfg.logs_dir)
     ensure_dir(cfg.signals_csv); ensure_dir(cfg.trades_csv); ensure_dir(cfg.ml_csv); ensure_dir(cfg.models_csv); ensure_dir(cfg.state_json)
+    ensure_dir(cfg.trades_live_csv)
     return cfg
 
 def main():
